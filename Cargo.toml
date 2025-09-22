@@ -1,0 +1,12 @@
+[package]
+name = "corel"
+version = "0.1.0"
+edition = "2021"
+description = "A tool for automatic semantic versioning based on commit messages."
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+git2 = "0.18"
+lazy_static = "1.4"
+regex = "1.10"
+thiserror = "1.0"
