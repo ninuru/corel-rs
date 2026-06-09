@@ -1,4 +1,5 @@
 use clap::Parser;
+use conventional_commit_parser::commit::CommitType;
 use git2::{Commit, ObjectType, Repository, Revwalk, Sort};
 use lazy_static::lazy_static;
 use regex::{Captures, Regex};
@@ -101,11 +102,8 @@ enum CorelError {
 type Result<T, E = CorelError> = std::result::Result<T, E>;
 
 lazy_static! {
-    static ref SEMVER_REGEX: Regex = Regex::new(
-        r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-.*)?(?:\+.*)?$"
-    ).unwrap();
-    static ref MAJOR_REGEX: Regex = Regex::new(r"^(BREAKING CHANGE)\s?(\(.+\))?\s?:(.+)").unwrap();
-    static ref MINOR_REGEX: Regex = Regex::new(r"^(feat|refactor)\s?(\(.+\))?\s?:(.+)").unwrap();
+    static ref SEMVER_REGEX: Regex = Regex::new(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-.*)?(?:\+.*)?$").unwrap();
+    static ref LEGACY_BREAKING_CHANGE_HEADER_REGEX: Regex = Regex::new(r"^(BREAKING CHANGE)\s?(\(.+\))?\s?:(.+)").unwrap();
 }
 
 impl PartialOrd for SemVerTag {
@@ -181,13 +179,23 @@ impl Version {
 
 /// Analyzes a commit message to determine the required version bump.
 fn analyze_commit_message(message: &str) -> BumpType {
-    if MAJOR_REGEX.is_match(message) {
-        BumpType::Major
-    } else if MINOR_REGEX.is_match(message) {
-        BumpType::Minor
-    } else {
-        BumpType::Patch
+    match conventional_commit_parser::parse(message) {
+        Ok(commit) if commit.is_breaking_change => BumpType::Major,
+        Ok(commit) => match commit.commit_type {
+            CommitType::Feature | CommitType::Refactor => BumpType::Minor,
+            _ => BumpType::Patch,
+        },
+        Err(_) if has_breaking_change_header(message) => BumpType::Major,
+        Err(_) => BumpType::Patch,
     }
+}
+
+fn has_breaking_change_header(message: &str) -> bool {
+    message
+        .lines()
+        .next()
+        .map(|header| LEGACY_BREAKING_CHANGE_HEADER_REGEX.is_match(header))
+        .unwrap_or(false)
 }
 
 /// Collects commits from a repository since a specified commit.
@@ -200,10 +208,7 @@ fn collect_commits<'repo>(repo: &'repo Repository, since_oid: Option<git2::Oid>)
         revwalk.hide(oid)?;
     }
 
-    let commits: std::result::Result<Vec<Commit>, git2::Error> = revwalk
-        .filter_map(|oid| oid.ok())
-        .map(|oid| repo.find_commit(oid))
-        .collect();
+    let commits: std::result::Result<Vec<Commit>, git2::Error> = revwalk.filter_map(|oid| oid.ok()).map(|oid| repo.find_commit(oid)).collect();
 
     Ok(commits?)
 }
@@ -251,8 +256,7 @@ fn auto_initialize_tag(repo: &Repository, args: &Cli) -> Result<Vec<String>> {
         eprintln!("No tags found. Analyzing all commits to create initial version from {}.", args.initial_version);
     }
 
-    let mut version = Version::from_str(&args.initial_version)
-        .map_err(|_| CorelError::InvalidInitialVersion(args.initial_version.clone()))?;
+    let mut version = Version::from_str(&args.initial_version).map_err(|_| CorelError::InvalidInitialVersion(args.initial_version.clone()))?;
 
     let commits = collect_commits(repo, None)?;
     if commits.is_empty() {
@@ -297,9 +301,7 @@ fn check(args: Cli) -> Result<bool> {
 
     let has_latest_tag = match find_latest_semver_tag(&repo)? {
         Some(_) => true,
-        None => {
-            auto_initialize_tag(&repo, &args).is_ok()
-        }
+        None => auto_initialize_tag(&repo, &args).is_ok(),
     };
 
     Ok(has_latest_tag)
@@ -332,7 +334,7 @@ fn run(args: Cli) -> Result<Vec<String>> {
         _ => return Err(CorelError::TagCommitNotFound(latest_tag.name.clone())),
     };
 
-    let highest_bump =  {
+    let highest_bump = {
         let commits = collect_commits(&repo, Some(tag_commit_oid))?;
         commits
             .iter()
@@ -357,11 +359,7 @@ fn run(args: Cli) -> Result<Vec<String>> {
     }
 
     if !args.quiet && !tags_to_create.is_empty() {
-        eprintln!(
-            "Calculated version: {}. Creating tags: {}",
-            next_version,
-            tags_to_create.join(", ")
-        );
+        eprintln!("Calculated version: {}. Creating tags: {}", next_version, tags_to_create.join(", "));
     }
 
     for tag_name in &tags_to_create {
@@ -394,5 +392,58 @@ fn main() {
             eprintln!("ERROR: {}", e);
             exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn breaking_change_marker_requires_major_bump() {
+        assert_eq!(analyze_commit_message("feat(api)!: replace public endpoint"), BumpType::Major);
+    }
+
+    #[test]
+    fn breaking_change_footer_requires_major_bump() {
+        let message = "fix: update parser\n\nBREAKING CHANGE: old input is rejected";
+
+        assert_eq!(analyze_commit_message(message), BumpType::Major);
+    }
+
+    #[test]
+    fn breaking_change_header_requires_major_bump() {
+        assert_eq!(analyze_commit_message("BREAKING CHANGE: replace legacy config"), BumpType::Major);
+    }
+
+    #[test]
+    fn scoped_breaking_change_header_requires_major_bump() {
+        assert_eq!(analyze_commit_message("BREAKING CHANGE(api): replace config"), BumpType::Major);
+    }
+
+    #[test]
+    fn breaking_change_header_with_body_requires_major_bump() {
+        let message = "BREAKING CHANGE: replace legacy config\n\nold config files are no longer accepted";
+
+        assert_eq!(analyze_commit_message(message), BumpType::Major);
+    }
+
+    #[test]
+    fn breaking_change_header_with_body_and_footer_requires_major_bump() {
+        let message = "BREAKING CHANGE: replace legacy config\nold config files are no longer accepted\nRefs #123";
+
+        assert_eq!(analyze_commit_message(message), BumpType::Major);
+    }
+
+    #[test]
+    fn feature_and_refactor_commits_require_minor_bump() {
+        assert_eq!(analyze_commit_message("feat: add repository flag"), BumpType::Minor);
+        assert_eq!(analyze_commit_message("refactor(core): simplify tags"), BumpType::Minor);
+    }
+
+    #[test]
+    fn fix_and_non_conventional_commits_require_patch_bump() {
+        assert_eq!(analyze_commit_message("fix: handle empty repository"), BumpType::Patch);
+        assert_eq!(analyze_commit_message("update readme"), BumpType::Patch);
     }
 }

@@ -6,6 +6,7 @@ description = "A tool for automatic semantic versioning based on commit messages
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+conventional_commit_parser = "0.9.4"
 git2 = "0.18"
 lazy_static = "1.4"
 regex = "1.10"
