@@ -179,6 +179,8 @@ impl Version {
 
 /// Analyzes a commit message to determine the required version bump.
 fn analyze_commit_message(message: &str) -> BumpType {
+    let message = message.trim_end();
+
     match conventional_commit_parser::parse(message) {
         Ok(commit) if commit.is_breaking_change => BumpType::Major,
         Ok(commit) => match commit.commit_type {
@@ -401,6 +403,8 @@ mod tests {
 
     #[test]
     fn breaking_change_marker_requires_major_bump() {
+        assert_eq!(analyze_commit_message("feat!: test\n\n"), BumpType::Major);
+        assert_eq!(analyze_commit_message("feat!: replace public endpoint"), BumpType::Major);
         assert_eq!(analyze_commit_message("feat(api)!: replace public endpoint"), BumpType::Major);
     }
 
